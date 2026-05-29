@@ -1,13 +1,17 @@
 """
 Claims & Citas Dashboard — Brio Management
-Genera docs/index.html con datos de Shopmonkey + NLS.
-Corre localmente via Task Scheduler cada hora.
+Categorías:
+  1. FYBA / Insurance  — NLS task template=2 (INSURANCE)
+  2. Garantía          — NLS task template=4 (WARRANTY)
+  3. Pérdida Total     — NLS task template=5 (VEHICLE LOSS)
+  4. Shopmonkey Otros  — órdenes/citas sin task NLS
+
+Deduplicación: si un VIN tiene task NLS + cita/orden Shopmonkey → 1 caso.
 """
 
-import os, json, time, pyodbc
+import os, json, time, pyodbc, requests
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.request, urllib.parse
 
 # ── Credenciales ──────────────────────────────────────────────────────────────
 SM_TOKEN = os.environ.get("SM_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJjaWQiOiIwYTFhZWFmYy04MjdjLTQ4NDItYTE2Zi01MzVmMzUzMzhhZDQiLCJpZCI6ImY3MjI0NGRiLTBmNWEtNDEzYS1hOTk2LTU0NzE1NjFkOTI1YSIsImxpZCI6Ijk5ODhlYjQ2LTYxNmEtNDA0NC04NmJiLTAwNzI3MWJjODZiMyIsInAiOiJhcGkiLCJyaWQiOiJ1YzEiLCJzYWQiOjAsInNpZCI6ImRjZWRmM2Y5YzYxY2YxZDAiLCJ0Y2lkIjoiMGExYWVhZmMtODI3Yy00ODQyLWExNmYtNTM1ZjM1MzM4YWQ0IiwiZGF0YVNoYXJpbmciOmZhbHNlLCJoYXNIcSI6ZmFsc2UsIm9uYiI6NywicGF5Ijo2LCJhdWQiOiJhcGkiLCJpc3MiOiJodHRwczovL2FwaS5zaG9wbW9ua2V5LmNsb3VkIiwiaWF0IjoxNzc4NjE2MzE2LCJleHAiOjQ5MzQzNzYzMTZ9.lx_jaNxw_-mAeEgEswZ2CVQUYuilPNvaxKq-zsx-6zM")
@@ -19,29 +23,122 @@ NLS_CONN = (
     "TrustServerCertificate=yes;"
 )
 SM_BASE = "https://api.shopmonkey.cloud/v3"
-SM_HDR  = {"Authorization": f"Bearer {SM_TOKEN}", "Content-Type": "application/json"}
-
-ET = timezone(timedelta(hours=-4))  # Eastern (EDT)
-
-ENG_KW = ['engine','motor','transmis','long block','short block','transaxle','cvt','rebuilt']
+SM_HDR  = {"Authorization": f"Bearer {SM_TOKEN}"}
+ET      = timezone(timedelta(hours=-4))
+ENG_KW  = ['engine','motor','transmis','long block','short block','transaxle','cvt','rebuilt']
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 def sm_get(path, retries=4):
     url = SM_BASE + path
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers=SM_HDR)
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read())
+            r = requests.get(url, headers=SM_HDR, timeout=30)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+            return r.json()
         except Exception as e:
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
+                print(f"  WARN sm_get {path}: {e}")
                 return None
 
-# ── Fetch orders (smart pagination) ──────────────────────────────────────────
+def parse_date(raw):
+    if not raw:
+        return "", ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(ET)
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m")
+    except Exception:
+        return raw[:10], raw[:7]
+
+# ── NLS: fetch tasks ──────────────────────────────────────────────────────────
+def fetch_nls_tasks():
+    print("NLS: fetching tasks...")
+    conn = pyodbc.connect(NLS_CONN)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            t.task_refno,
+            t.task_template_no,
+            tt.task_template_name,
+            t.subject,
+            t.creation_date,
+            t.completion_date,
+            tsc.status_code,
+            CAST(l.loan_number AS VARCHAR(20)) AS loan_number,
+            l.name AS client,
+            cv.vin,
+            COALESCE(lpc.portfolio_description,'') AS portfolio,
+            t.notes
+        FROM task t
+        JOIN task_template tt ON tt.task_template_no = t.task_template_no
+        LEFT JOIN task_status_codes tsc ON tsc.status_code_id = t.status_code_id
+        LEFT JOIN loanacct l ON l.acctrefno = t.NLS_refno
+        LEFT JOIN loanacct_collateral_link lcl ON lcl.acctrefno = l.acctrefno
+        LEFT JOIN collateral_vehicle cv ON cv.collateral_id = lcl.collateral_id
+        LEFT JOIN loan_port_codes lpc ON lpc.portfolio_code_id = l.portfolio_code_id
+        WHERE t.task_template_no IN (2, 4, 5)
+        ORDER BY t.creation_date DESC
+    """)
+    tasks = []
+    for row in cur.fetchall():
+        refno, tmpl_no, tmpl_name, subject, created, completed, status_code, loan, client, vin, portfolio, notes = row
+        is_open = completed is None
+        created_str  = created.strftime("%Y-%m-%d")  if created  else ""
+        created_mon  = created.strftime("%Y-%m")     if created  else ""
+        completed_str= completed.strftime("%Y-%m-%d") if completed else ""
+        days_open    = (datetime.now() - created).days if created and is_open else (
+                       (completed - created).days if created and completed else 0)
+        category = {2: "FYBA / Insurance", 4: "Garantía", 5: "Pérdida Total"}.get(int(tmpl_no), "Otro")
+        billed_to = {2: "FYBA Reinsurance", 4: "Brio (Garantía)", 5: "Seguro / Total Loss"}.get(int(tmpl_no), "")
+        tasks.append({
+            "task_refno":   int(refno),
+            "category":     category,
+            "billed_to":    billed_to,
+            "subject":      subject or "",
+            "created":      created_str,
+            "created_mon":  created_mon,
+            "completed":    completed_str,
+            "is_open":      is_open,
+            "status":       status_code or "",
+            "days_open":    days_open,
+            "loan":         loan or "",
+            "client":       client or "",
+            "vin":          (vin or "").upper().strip(),
+            "portfolio":    portfolio,
+            "notes":        (notes or "")[:200],
+        })
+    conn.close()
+    print(f"NLS tasks: {len(tasks)}")
+    return tasks
+
+# ── NLS: fetch repossessed VINs (para detectar FYBA Remarketing) ──────────────
+def fetch_nls_repo_vins():
+    """VINs cuyo loan está en status repossessed (10) o repo in dealer (28)."""
+    conn = pyodbc.connect(NLS_CONN)
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT cv.vin
+        FROM collateral_vehicle cv
+        JOIN loanacct_collateral_link lcl ON lcl.collateral_id = cv.collateral_id
+        JOIN loanacct l ON l.acctrefno = lcl.acctrefno
+        WHERE l.status_code_no IN (10, 28)
+           OR l.acctrefno IN (
+               SELECT acctrefno FROM loanacct_statuses
+               WHERE status_code_no IN (10, 28)
+           )
+    """)
+    vins = set(row[0].upper().strip() for row in cur.fetchall() if row[0])
+    conn.close()
+    print(f"NLS repo VINs: {len(vins)}")
+    return vins
+
+# ── Shopmonkey: fetch orders ──────────────────────────────────────────────────
 def fetch_orders():
-    print("Fetching orders...")
+    print("SM: fetching orders...")
     seen, orders, empty_streak, offset = set(), [], 0, 0
     while True:
         data = sm_get(f"/order?limit=100&offset={offset}&sort=number&sortDir=asc")
@@ -52,7 +149,6 @@ def fetch_orders():
         for o in new:
             seen.add(o["id"])
             orders.append(o)
-        print(f"  offset={offset} new={len(new)} total={len(orders)}")
         if len(new) == 0:
             empty_streak += 1
             if empty_streak >= 6:
@@ -60,12 +156,12 @@ def fetch_orders():
         else:
             empty_streak = 0
         offset += 100
-    print(f"Orders: {len(orders)}")
+    print(f"SM orders: {len(orders)}")
     return orders
 
-# ── Fetch appointments ────────────────────────────────────────────────────────
+# ── Shopmonkey: fetch appointments ────────────────────────────────────────────
 def fetch_appointments():
-    print("Fetching appointments...")
+    print("SM: fetching appointments...")
     appts, offset = [], 0
     while True:
         data = sm_get(f"/appointment?limit=100&offset={offset}")
@@ -78,24 +174,22 @@ def fetch_appointments():
         if not data.get("hasMore"):
             break
         offset += 100
-    print(f"Appointments: {len(appts)}")
+    print(f"SM appointments: {len(appts)}")
     return appts
 
-# ── Fetch VINs ────────────────────────────────────────────────────────────────
+# ── Shopmonkey: fetch VINs ────────────────────────────────────────────────────
 def fetch_vins(vehicle_ids):
-    print(f"Fetching VINs for {len(vehicle_ids)} vehicles...")
+    print(f"SM: fetching VINs ({len(vehicle_ids)} vehicles)...")
     vid_to_vin = {}
     done = [0]
-
     def get_vin(vid):
         data = sm_get(f"/vehicle/{vid}")
         if data:
             v = data.get("data", {})
-            vin = v.get("vin") or ""
-            if vin and len(vin) >= 6:
-                return vid, vin.upper().strip()
+            vin = (v.get("vin") or "").upper().strip()
+            if len(vin) >= 6:
+                return vid, vin
         return vid, None
-
     with ThreadPoolExecutor(max_workers=8) as ex:
         futs = {ex.submit(get_vin, vid): vid for vid in vehicle_ids}
         for fut in as_completed(futs):
@@ -103,17 +197,16 @@ def fetch_vins(vehicle_ids):
             if vin:
                 vid_to_vin[vid] = vin
             done[0] += 1
-            if done[0] % 50 == 0:
+            if done[0] % 100 == 0:
                 print(f"  VINs: {done[0]}/{len(vehicle_ids)}")
     print(f"VINs fetched: {len(vid_to_vin)}")
     return vid_to_vin
 
-# ── Fetch services ────────────────────────────────────────────────────────────
+# ── Shopmonkey: fetch services ────────────────────────────────────────────────
 def fetch_services(order_ids):
-    print(f"Fetching services for {len(order_ids)} orders...")
+    print(f"SM: fetching services ({len(order_ids)} orders)...")
     result = {}
     done = [0]
-
     def get_svc(oid):
         data = sm_get(f"/order/{oid}/service")
         if not data:
@@ -121,20 +214,12 @@ def fetch_services(order_ids):
         svcs = []
         for s in data.get("data", []):
             name = s.get("name", "")
-            cost = s.get("totalCostCents", 0) or 0
-            labors = s.get("labors", []) or []
-            parts  = s.get("parts", []) or []
-            labor_desc = "; ".join(
-                f"{lb.get('name','')}" for lb in labors if lb.get("name")
-            )
-            part_desc = "; ".join(
-                f"{pt.get('name','')}" for pt in parts if pt.get("name")
-            )
-            desc = labor_desc or part_desc or name
-            is_et = any(k in (name + desc).lower() for k in ENG_KW)
-            svcs.append({"name": name, "desc": desc, "cost": cost / 100, "is_et": is_et})
+            cost = (s.get("totalCostCents") or 0) / 100
+            labors = [lb.get("name","") for lb in (s.get("labors") or []) if lb.get("name")]
+            desc   = "; ".join(labors) or name
+            is_et  = any(k in (name+desc).lower() for k in ENG_KW)
+            svcs.append({"name": name, "desc": desc, "cost": cost, "is_et": is_et})
         return oid, svcs
-
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = {ex.submit(get_svc, oid): oid for oid in order_ids}
         for fut in as_completed(futs):
@@ -143,292 +228,358 @@ def fetch_services(order_ids):
             done[0] += 1
             if done[0] % 100 == 0:
                 print(f"  Services: {done[0]}/{len(order_ids)}")
-    print("Services fetched")
+    print("Services done")
     return result
 
-# ── NLS lookup ────────────────────────────────────────────────────────────────
-def nls_lookup(vins):
-    if not vins:
-        return {}
-    print(f"NLS lookup for {len(vins)} VINs...")
-    conn = pyodbc.connect(NLS_CONN)
-    placeholders = ",".join(["?"] * len(vins))
-    sql = f"""
-        SELECT cv.vin,
-               CAST(l.loan_number AS VARCHAR(20)) AS loan_number,
-               l.name,
-               COALESCE(lpc.portfolio_description,'') AS portfolio,
-               l.status_code_no
-        FROM collateral_vehicle cv
-        JOIN loanacct_collateral_link lcl ON lcl.collateral_id = cv.collateral_id
-        JOIN loanacct l ON l.acctrefno = lcl.acctrefno
-        LEFT JOIN loan_port_codes lpc ON lpc.portfolio_code_id = l.portfolio_code_id
-        WHERE cv.vin IN ({placeholders})
-    """
-    cur = conn.cursor()
-    cur.execute(sql, list(vins))
-    nls = {}
-    for row in cur.fetchall():
-        vin = row[0].upper().strip()
-        if vin not in nls:
-            nls[vin] = {"loan": row[1], "name": row[2], "portfolio": row[3], "status": row[4]}
-    conn.close()
-    print(f"NLS: {len(nls)} VINs matched")
-    return nls
+# ── Build unified case records ────────────────────────────────────────────────
+def is_fyba_sm(name):
+    """True si el nombre de la cita/orden indica que FYBA es el cliente."""
+    return "FYBA" in (name or "").upper()
 
-# ── Build order records ───────────────────────────────────────────────────────
-def build_order_records(orders, vid_to_vin, services_map, nls_map):
-    records = []
+def build_cases(nls_tasks, orders, appts, vid_to_vin, services_map, repo_vins):
+    """
+    Returns list of unified case dicts.
+    Priority: NLS task = the case record.
+    Shopmonkey orders/appts linked by VIN are attached as supplementary data.
+    Orders with VINs that have NO NLS task → category "Shopmonkey (Externo)"
+    """
+
+    # Index Shopmonkey orders by VIN
+    vin_to_orders = {}
     for o in orders:
-        vid      = o.get("vehicleId") or ""
-        vin      = vid_to_vin.get(vid, "")
-        nls      = nls_map.get(vin, {})
+        vid = o.get("vehicleId") or ""
+        vin = vid_to_vin.get(vid, "")
+        if not vin:
+            vin = "__no_vin__" + o["id"]
         svcs     = services_map.get(o["id"], [])
         total    = (o.get("totalCostCents") or 0) / 100
-        if total == 0 and svcs:
+        if total == 0:
             total = sum(s["cost"] for s in svcs)
         et_cost  = sum(s["cost"] for s in svcs if s["is_et"])
         is_et    = any(s["is_et"] for s in svcs)
         svc_desc = " | ".join(s["name"] for s in svcs[:4] if s["name"])
-        order_type = o.get("orderType", o.get("type", ""))
-        is_open = order_type in ("RepairOrder", "Estimate")
-        raw_date = o.get("createdDate") or o.get("date") or ""
-        try:
-            dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(ET)
-            date_str  = dt.strftime("%Y-%m-%d")
-            month_key = dt.strftime("%Y-%m")
-        except Exception:
-            date_str  = raw_date[:10] if raw_date else ""
-            month_key = raw_date[:7] if raw_date else ""
-        records.append({
-            "id":        o["id"],
-            "number":    o.get("number", ""),
-            "date":      date_str,
-            "month":     month_key,
-            "vin":       vin,
-            "loan":      nls.get("loan", ""),
-            "client":    nls.get("name", o.get("coalescedName", "")),
-            "portfolio": nls.get("portfolio", ""),
-            "status":    nls.get("status", ""),
-            "total":     total,
-            "et_cost":   et_cost,
-            "is_et":     is_et,
-            "is_open":   is_open,
-            "order_type": order_type,
-            "desc":      svc_desc,
-        })
-    records.sort(key=lambda r: r["date"], reverse=True)
-    return records
-
-# ── Build appointment records ─────────────────────────────────────────────────
-def build_appt_records(appts, vid_to_vin, nls_map):
-    seen_client = {}
-    for a in appts:
-        vid   = a.get("vehicleId") or ""
-        vin   = vid_to_vin.get(vid, "")
-        nls   = nls_map.get(vin, {})
-        raw_date = a.get("date") or a.get("scheduledDate") or ""
-        try:
-            dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(ET)
-            date_str  = dt.strftime("%Y-%m-%d")
-            month_key = dt.strftime("%Y-%m")
-        except Exception:
-            date_str  = raw_date[:10] if raw_date else ""
-            month_key = raw_date[:7] if raw_date else ""
-        conf_status = a.get("confirmationStatus", "NoResponse")
+        order_type = o.get("orderType", o.get("type",""))
+        is_open    = order_type in ("RepairOrder", "Estimate")
+        date_str, mon = parse_date(o.get("createdDate") or o.get("date",""))
+        sm_name  = o.get("coalescedName","")
         rec = {
-            "date":      date_str,
-            "month":     month_key,
-            "name":      a.get("name", ""),
-            "vin":       vin,
-            "loan":      nls.get("loan", ""),
-            "portfolio": nls.get("portfolio", ""),
-            "note":      a.get("note", "") or "",
-            "status":    conf_status,
+            "sm_id": o["id"], "sm_number": o.get("number",""),
+            "sm_name": sm_name, "date": date_str, "month": mon,
+            "total": total, "et_cost": et_cost, "is_et": is_et,
+            "is_open": is_open, "order_type": order_type, "desc": svc_desc,
         }
-        client_key = a.get("name", "").strip().upper()
-        if client_key not in seen_client:
-            seen_client[client_key] = rec
-        else:
-            existing = seen_client[client_key]
-            priority = {"Confirmed": 0, "NoResponse": 1, "Declined": 2}
-            if priority.get(conf_status, 9) < priority.get(existing["status"], 9):
-                seen_client[client_key] = rec
-    records = sorted(seen_client.values(), key=lambda r: r["date"], reverse=True)
-    return records
+        if vin not in vin_to_orders:
+            vin_to_orders[vin] = []
+        vin_to_orders[vin].append(rec)
 
-# ── Monthly aggregates ────────────────────────────────────────────────────────
-def monthly_stats(records, appt_records):
-    months_o = {}
-    for r in records:
-        m = r["month"]
-        if not m:
+    # Index Shopmonkey appointments by VIN (deduplicated: prefer Confirmed)
+    vin_to_appts = {}
+    for a in appts:
+        vid = a.get("vehicleId") or ""
+        vin = vid_to_vin.get(vid, "")
+        if not vin:
             continue
-        if m not in months_o:
-            months_o[m] = {"orders": 0, "total": 0.0, "et_cost": 0.0, "open": 0}
-        months_o[m]["orders"] += 1
-        months_o[m]["total"]  += r["total"]
-        months_o[m]["et_cost"] += r["et_cost"]
-        if r["is_open"]:
-            months_o[m]["open"] += 1
-
-    months_a = {}
-    for a in appt_records:
-        m = a["month"]
-        if not m:
-            continue
-        if m not in months_a:
-            months_a[m] = {"total": 0, "confirmed": 0, "declined": 0, "noresp": 0}
-        months_a[m]["total"] += 1
-        if a["status"] == "Confirmed":
-            months_a[m]["confirmed"] += 1
-        elif a["status"] == "Declined":
-            months_a[m]["declined"] += 1
+        date_str, mon = parse_date(a.get("date") or a.get("scheduledDate",""))
+        conf = a.get("confirmationStatus","NoResponse")
+        rec = {
+            "name": a.get("name",""), "date": date_str, "month": mon,
+            "note": a.get("note","") or "", "status": conf,
+        }
+        if vin not in vin_to_appts:
+            vin_to_appts[vin] = rec
         else:
-            months_a[m]["noresp"] += 1
+            prio = {"Confirmed":0,"NoResponse":1,"Declined":2}
+            if prio.get(conf,9) < prio.get(vin_to_appts[vin]["status"],9):
+                vin_to_appts[vin] = rec
 
-    all_months = sorted(set(list(months_o.keys()) + list(months_a.keys())))[-14:]
-    stats = []
-    for m in all_months:
-        o = months_o.get(m, {"orders":0,"total":0,"et_cost":0,"open":0})
-        a = months_a.get(m, {"total":0,"confirmed":0,"declined":0,"noresp":0})
-        stats.append({"month": m, **o,
-                      "appts": a["total"], "conf": a["confirmed"],
-                      "decl": a["declined"], "noresp": a["noresp"]})
+    # VINs that have NLS tasks
+    task_vins = set(t["vin"] for t in nls_tasks if t["vin"])
+
+    # Build case list from NLS tasks
+    cases = []
+    for t in nls_tasks:
+        vin = t["vin"]
+        sm_orders = vin_to_orders.get(vin, [])
+        sm_appt   = vin_to_appts.get(vin)
+        sm_cost   = sum(o["total"] for o in sm_orders)
+        sm_et     = sum(o["et_cost"] for o in sm_orders)
+        sm_open   = any(o["is_open"] for o in sm_orders)
+        sm_desc   = " | ".join(o["desc"] for o in sm_orders[:2] if o["desc"])
+        sm_dates  = sorted(set(o["date"] for o in sm_orders if o["date"]))
+        sm_first  = sm_dates[0] if sm_dates else ""
+        sm_last   = sm_dates[-1] if sm_dates else ""
+        appt_note = sm_appt["note"][:120] if sm_appt else ""
+        appt_status = sm_appt["status"] if sm_appt else ""
+
+        cases.append({
+            "source":     "NLS",
+            "category":   t["category"],
+            "billed_to":  t["billed_to"],
+            "task_refno": t["task_refno"],
+            "subject":    t["subject"],
+            "client":     t["client"] or (sm_appt["name"] if sm_appt else ""),
+            "loan":       t["loan"],
+            "vin":        vin,
+            "portfolio":  t["portfolio"],
+            "nls_open":   t["is_open"],
+            "status":     t["status"],
+            "days_open":  t["days_open"],
+            "created":    t["created"],
+            "created_mon":t["created_mon"],
+            "completed":  t["completed"],
+            "notes":      t["notes"],
+            # Shopmonkey linked data
+            "sm_orders":  len(sm_orders),
+            "sm_cost":    sm_cost,
+            "sm_et":      sm_et,
+            "sm_open":    sm_open,
+            "sm_desc":    sm_desc[:120],
+            "sm_first":   sm_first,
+            "sm_last":    sm_last,
+            "appt_note":  appt_note,
+            "appt_status":appt_status,
+        })
+
+    # Shopmonkey records with NO NLS task (external / FYBA remarketing / other)
+    for vin, sm_orders_list in vin_to_orders.items():
+        if vin.startswith("__no_vin__") or vin in task_vins:
+            continue
+        sm_cost = sum(o["total"] for o in sm_orders_list)
+        sm_et   = sum(o["et_cost"] for o in sm_orders_list)
+        sm_open = any(o["is_open"] for o in sm_orders_list)
+        sm_desc = " | ".join(o["desc"] for o in sm_orders_list[:2] if o["desc"])
+        sm_dates = sorted(set(o["date"] for o in sm_orders_list if o["date"]))
+        first_date = sm_dates[0] if sm_dates else ""
+        last_date  = sm_dates[-1] if sm_dates else ""
+        mon = first_date[:7] if first_date else ""
+        client = sm_orders_list[0]["sm_name"] if sm_orders_list else ""
+        appt   = vin_to_appts.get(vin)
+        appt_name = appt["name"] if appt else ""
+
+        # Detectar FYBA Remarketing: FYBA figura como cliente en SM Y el vehículo
+        # está en status repo en NLS (o no tiene loan activo) → FYBA lo arregla para reventa
+        fyba_in_sm = is_fyba_sm(appt_name) or is_fyba_sm(client)
+        is_repo_vin = vin in repo_vins
+        if fyba_in_sm:
+            category  = "FYBA / Remarketing"
+            billed_to = "FYBA Reinsurance (Remarketing)"
+        else:
+            category  = "Shopmonkey (Externo)"
+            billed_to = "Cliente directo"
+
+        cases.append({
+            "source":      "SM",
+            "category":    category,
+            "billed_to":   billed_to,
+            "task_refno":  0,
+            "subject":     "",
+            "client":      client,
+            "loan":        "",
+            "vin":         vin,
+            "portfolio":   "",
+            "nls_open":    False,
+            "status":      "OPEN" if sm_open else "CLOSED",
+            "days_open":   0,
+            "created":     first_date,
+            "created_mon": mon,
+            "completed":   "" if sm_open else last_date,
+            "notes":       "",
+            "sm_orders":   len(sm_orders_list),
+            "sm_cost":     sm_cost,
+            "sm_et":       sm_et,
+            "sm_open":     sm_open,
+            "sm_desc":     sm_desc[:120],
+            "sm_first":    first_date,
+            "sm_last":     last_date,
+            "appt_note":   appt["note"][:120] if appt else "",
+            "appt_status": appt["status"] if appt else "",
+        })
+
+    cases.sort(key=lambda c: c["created"], reverse=True)
+    return cases
+
+# ── Aggregations ──────────────────────────────────────────────────────────────
+CATS = ["FYBA / Insurance", "FYBA / Remarketing", "Garantía", "Pérdida Total", "Shopmonkey (Externo)"]
+CAT_COLORS = {
+    "FYBA / Insurance":    "#2E75B6",
+    "FYBA / Remarketing":  "#0070C0",
+    "Garantía":            "#70AD47",
+    "Pérdida Total":       "#ED7D31",
+    "Shopmonkey (Externo)":"#7030A0",
+}
+
+def cat_stats(cases):
+    stats = {c: {"total":0,"open":0,"closed":0,"cost":0.0,"et":0.0} for c in CATS}
+    for c in cases:
+        cat = c["category"]
+        if cat not in stats:
+            stats[cat] = {"total":0,"open":0,"closed":0,"cost":0.0,"et":0.0}
+        stats[cat]["total"] += 1
+        if c["nls_open"] or c["sm_open"]:
+            stats[cat]["open"] += 1
+        else:
+            stats[cat]["closed"] += 1
+        stats[cat]["cost"] += c["sm_cost"]
+        stats[cat]["et"]   += c["sm_et"]
     return stats
 
-# ── Portfolio stats ───────────────────────────────────────────────────────────
-def portfolio_stats(records):
-    ports = {}
-    for r in records:
-        p = r["portfolio"] or "Sin Portfolio"
-        if p not in ports:
-            ports[p] = {"orders": 0, "total": 0.0, "et_cost": 0.0, "open": 0}
-        ports[p]["orders"] += 1
-        ports[p]["total"]  += r["total"]
-        ports[p]["et_cost"] += r["et_cost"]
-        if r["is_open"]:
-            ports[p]["open"] += 1
-    return sorted(ports.items(), key=lambda x: x[1]["total"], reverse=True)
+def monthly_stats(cases):
+    months = {}
+    for c in cases:
+        m = c["created_mon"]
+        if not m:
+            continue
+        if m not in months:
+            months[m] = {cat: {"new":0,"cost":0.0} for cat in CATS}
+            months[m]["__total"] = {"new":0,"open":0,"cost":0.0}
+        cat = c["category"]
+        if cat not in months[m]:
+            months[m][cat] = {"new":0,"cost":0.0}
+        months[m][cat]["new"]  += 1
+        months[m][cat]["cost"] += c["sm_cost"]
+        months[m]["__total"]["new"]  += 1
+        months[m]["__total"]["cost"] += c["sm_cost"]
+        if c["nls_open"] or c["sm_open"]:
+            months[m]["__total"]["open"] += 1
+    return dict(sorted(months.items())[-14:])
 
-# ── HTML generation ───────────────────────────────────────────────────────────
+# ── HTML helpers ──────────────────────────────────────────────────────────────
 def fmt_usd(v):
     return f"${v:,.0f}"
 
-def badge_status(st):
-    m = {"Confirmed": ("success","Confirmed ✓"),
-         "Declined":  ("danger","Declined ✗"),
-         "NoResponse":("warning","Sin respuesta")}
-    cls, label = m.get(st, ("secondary", st))
-    return f'<span class="badge bg-{cls}">{label}</span>'
+def status_badge(case):
+    is_open = case["nls_open"] or case["sm_open"]
+    if is_open:
+        days = case["days_open"]
+        color = "danger" if days > 30 else "warning"
+        return f'<span class="badge bg-{color}">Abierto {days}d</span>'
+    return '<span class="badge bg-success">Cerrado</span>'
 
-def build_html(order_records, appt_records, monthly, portfolio):
-    now_et = datetime.now(ET)
-    cur_month = now_et.strftime("%Y-%m")
+def cat_badge(cat):
+    color_map = {
+        "FYBA / Insurance":    "primary",
+        "Garantía":            "success",
+        "Pérdida Total":       "warning text-dark",
+        "Shopmonkey (Externo)":"secondary",
+    }
+    cls = color_map.get(cat, "secondary")
+    return f'<span class="badge bg-{cls}">{cat}</span>'
+
+def appt_badge(st):
+    m = {"Confirmed":"success","Declined":"danger","NoResponse":"warning text-dark"}
+    cls = m.get(st,"secondary")
+    return f'<span class="badge bg-{cls}">{st}</span>' if st else ""
+
+# ── HTML generation ───────────────────────────────────────────────────────────
+def build_html(cases):
+    now_et     = datetime.now(ET)
+    cur_month  = now_et.strftime("%Y-%m")
     prev_month = (now_et.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    cstats     = cat_stats(cases)
+    monthly    = monthly_stats(cases)
 
-    # ── KPI calculations ──────────────────────────────────────────────────────
-    total_orders = len(order_records)
-    total_cost   = sum(r["total"] for r in order_records)
-    total_et     = sum(r["et_cost"] for r in order_records)
-    open_orders  = [r for r in order_records if r["is_open"]]
-    open_cost    = sum(r["total"] for r in open_orders)
-
-    this_month_r = [r for r in order_records if r["month"] == cur_month]
-    last_month_r = [r for r in order_records if r["month"] == prev_month]
-    this_m_cost  = sum(r["total"] for r in this_month_r)
-    last_m_cost  = sum(r["total"] for r in last_month_r)
-    this_m_et    = sum(r["et_cost"] for r in this_month_r)
-
-    total_appts  = len(appt_records)
-    conf_appts   = sum(1 for a in appt_records if a["status"] == "Confirmed")
-    decl_appts   = sum(1 for a in appt_records if a["status"] == "Declined")
-    noresp_appts = sum(1 for a in appt_records if a["status"] == "NoResponse")
-    this_m_appts = sum(1 for a in appt_records if a["month"] == cur_month)
-    conf_this_m  = sum(1 for a in appt_records if a["month"] == cur_month and a["status"] == "Confirmed")
-
-    et_pct = (total_et / total_cost * 100) if total_cost else 0
+    total_open   = sum(1 for c in cases if c["nls_open"] or c["sm_open"])
+    total_closed = sum(1 for c in cases if not (c["nls_open"] or c["sm_open"]))
+    total_cost   = sum(c["sm_cost"] for c in cases)
+    open_cost    = sum(c["sm_cost"] for c in cases if c["nls_open"] or c["sm_open"])
+    this_m_new   = sum(1 for c in cases if c["created_mon"] == cur_month)
+    this_m_cost  = sum(c["sm_cost"] for c in cases if c["created_mon"] == cur_month)
 
     # ── Chart data ────────────────────────────────────────────────────────────
-    last12 = monthly[-12:]
-    chart_labels  = json.dumps([m["month"] for m in last12])
-    chart_total   = json.dumps([round(m["total"],2) for m in last12])
-    chart_et      = json.dumps([round(m["et_cost"],2) for m in last12])
-    chart_appts   = json.dumps([m["appts"] for m in last12])
-    chart_conf    = json.dumps([m["conf"] for m in last12])
+    months_sorted = sorted(monthly.keys())[-12:]
+    chart_labels  = json.dumps(months_sorted)
+    chart_fyba    = json.dumps([monthly.get(m,{}).get("FYBA / Insurance",{}).get("new",0) for m in months_sorted])
+    chart_fybar   = json.dumps([monthly.get(m,{}).get("FYBA / Remarketing",{}).get("new",0) for m in months_sorted])
+    chart_guar    = json.dumps([monthly.get(m,{}).get("Garantía",{}).get("new",0) for m in months_sorted])
+    chart_vl      = json.dumps([monthly.get(m,{}).get("Pérdida Total",{}).get("new",0) for m in months_sorted])
+    chart_ext     = json.dumps([monthly.get(m,{}).get("Shopmonkey (Externo)",{}).get("new",0) for m in months_sorted])
+    chart_cost    = json.dumps([round(monthly.get(m,{}).get("__total",{}).get("cost",0),0) for m in months_sorted])
 
-    port_labels = json.dumps([p for p,_ in portfolio[:8]])
-    port_vals   = json.dumps([round(v["total"],2) for _,v in portfolio[:8]])
+    pie_labels = json.dumps(list(CATS))
+    pie_vals   = json.dumps([cstats.get(c,{}).get("total",0) for c in CATS])
 
-    # ── Open orders rows ──────────────────────────────────────────────────────
-    open_rows_html = ""
-    for r in sorted(open_orders, key=lambda x: x["date"], reverse=True)[:50]:
-        et_badge = '<span class="badge bg-warning text-dark">Motor/Trans</span>' if r["is_et"] else ""
-        open_rows_html += f"""
+    # ── Open cases table ──────────────────────────────────────────────────────
+    open_cases = [c for c in cases if c["nls_open"] or c["sm_open"]]
+    open_rows  = ""
+    for c in sorted(open_cases, key=lambda x: x["days_open"], reverse=True)[:100]:
+        open_rows += f"""
         <tr>
-          <td>{r['date']}</td>
-          <td><small>{r['number']}</small></td>
-          <td>{r['client']}</td>
-          <td><code class="text-muted small">{r['vin']}</code></td>
-          <td>{r['loan']}</td>
-          <td><small>{r['portfolio']}</small></td>
-          <td class="text-end fw-bold">{fmt_usd(r['total'])}</td>
-          <td>{et_badge}</td>
-          <td><small class="text-muted">{r['desc'][:80]}</small></td>
+          <td>{cat_badge(c['category'])}</td>
+          <td>{c['created']}</td>
+          <td><strong>{c['client']}</strong></td>
+          <td><code class="small">{c['vin']}</code></td>
+          <td>{c['loan']}</td>
+          <td><small>{c['portfolio']}</small></td>
+          <td>{status_badge(c)}</td>
+          <td class="text-end fw-bold">{fmt_usd(c['sm_cost'])}</td>
+          <td><small>{c['billed_to']}</small></td>
+          <td><small class="text-muted">{(c['appt_note'] or c['sm_desc'])[:80]}</small></td>
         </tr>"""
 
-    # ── Appointments rows (last 60 days) ──────────────────────────────────────
-    cutoff = (now_et - timedelta(days=60)).strftime("%Y-%m-%d")
-    recent_appts = [a for a in appt_records if a["date"] >= cutoff]
-    appt_rows_html = ""
-    for a in recent_appts[:80]:
-        row_cls = "table-success" if a["status"]=="Confirmed" else (
-                  "table-danger" if a["status"]=="Declined" else "table-warning")
-        appt_rows_html += f"""
-        <tr class="{row_cls}">
-          <td>{a['date']}</td>
-          <td>{a['name']}</td>
-          <td><code class="text-muted small">{a['vin']}</code></td>
-          <td>{a['loan']}</td>
-          <td><small>{a['portfolio']}</small></td>
-          <td>{badge_status(a['status'])}</td>
-          <td><small>{a['note'][:100]}</small></td>
-        </tr>"""
+    # ── FYBA cases table ──────────────────────────────────────────────────────
+    def cases_table(cat, limit=200):
+        rows = ""
+        for c in [x for x in cases if x["category"] == cat][:limit]:
+            rows += f"""
+            <tr>
+              <td>{c['created']}</td>
+              <td><strong>{c['client']}</strong></td>
+              <td><code class="small">{c['vin']}</code></td>
+              <td>{c['loan']}</td>
+              <td><small>{c['portfolio']}</small></td>
+              <td>{status_badge(c)}</td>
+              <td>{c['completed'] or '—'}</td>
+              <td class="text-end fw-bold">{fmt_usd(c['sm_cost'])}</td>
+              <td>{appt_badge(c['appt_status'])}</td>
+              <td><small class="text-muted">{(c['appt_note'] or c['sm_desc'] or c['notes'])[:80]}</small></td>
+            </tr>"""
+        return rows or '<tr><td colspan="10" class="text-center text-muted">Sin datos</td></tr>'
 
-    # ── Monthly summary rows ──────────────────────────────────────────────────
-    monthly_rows_html = ""
-    for m in reversed(monthly[-14:]):
-        trend = "↑" if m["total"] > (monthly[monthly.index(m)-1]["total"] if monthly.index(m)>0 else 0) else "↓"
-        monthly_rows_html += f"""
+    rows_fyba  = cases_table("FYBA / Insurance")
+    rows_fybar = cases_table("FYBA / Remarketing")
+    rows_guar  = cases_table("Garantía")
+    rows_vl    = cases_table("Pérdida Total")
+    rows_ext   = cases_table("Shopmonkey (Externo)")
+
+    # ── Monthly summary table ─────────────────────────────────────────────────
+    month_rows = ""
+    for m in reversed(months_sorted):
+        md = monthly.get(m, {})
+        tot = md.get("__total", {})
+        month_rows += f"""
         <tr>
-          <td class="fw-semibold">{m['month']}</td>
-          <td class="text-end">{m['orders']}</td>
-          <td class="text-end fw-bold">{fmt_usd(m['total'])}</td>
-          <td class="text-end text-warning">{fmt_usd(m['et_cost'])}</td>
-          <td class="text-end">{m['open']}</td>
-          <td class="text-end">{m['appts']}</td>
-          <td class="text-end text-success">{m['conf']}</td>
-          <td class="text-end text-danger">{m['decl']}</td>
+          <td class="fw-semibold">{m}</td>
+          <td class="text-end">{tot.get('new',0)}</td>
+          <td class="text-end text-primary">{md.get('FYBA / Insurance',{}).get('new',0)}</td>
+          <td class="text-end text-success">{md.get('Garantía',{}).get('new',0)}</td>
+          <td class="text-end text-warning">{md.get('Pérdida Total',{}).get('new',0)}</td>
+          <td class="text-end text-secondary">{md.get('Shopmonkey (Externo)',{}).get('new',0)}</td>
+          <td class="text-end fw-bold">{fmt_usd(tot.get('cost',0))}</td>
+          <td class="text-end text-danger">{tot.get('open',0)}</td>
         </tr>"""
 
-    # ── Portfolio rows ────────────────────────────────────────────────────────
-    port_rows_html = ""
-    for p, v in portfolio:
-        pct = (v["et_cost"] / v["total"] * 100) if v["total"] else 0
-        port_rows_html += f"""
-        <tr>
-          <td>{p}</td>
-          <td class="text-end">{v['orders']}</td>
-          <td class="text-end fw-bold">{fmt_usd(v['total'])}</td>
-          <td class="text-end text-warning">{fmt_usd(v['et_cost'])}</td>
-          <td class="text-end"><small>{pct:.0f}%</small></td>
-          <td class="text-end text-danger">{v['open']}</td>
-        </tr>"""
+    # ── KPI cards per category ────────────────────────────────────────────────
+    def kpi_cat(cat, cls):
+        s = cstats.get(cat, {})
+        label = cat.replace("Shopmonkey (Externo)","Externo")
+        return f"""
+        <div class="col-6 col-md-3">
+          <div class="card p-3 h-100 border-{cls}" style="border-left:4px solid!important">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-val" style="color:var(--bs-{cls})">{s.get('open',0)} <small class="text-muted fs-6">abiertos</small></div>
+            <small class="text-muted">{s.get('total',0)} total &bull; {fmt_usd(s.get('cost',0))}</small>
+          </div>
+        </div>"""
 
-    # ── Month label helper ────────────────────────────────────────────────────
+    cat_kpi_html = (kpi_cat("FYBA / Insurance","primary") +
+                    kpi_cat("FYBA / Remarketing","info") +
+                    kpi_cat("Garantía","success") +
+                    kpi_cat("Pérdida Total","warning") +
+                    kpi_cat("Shopmonkey (Externo)","secondary"))
+
     mnames = {"01":"Ene","02":"Feb","03":"Mar","04":"Abr","05":"May","06":"Jun",
               "07":"Jul","08":"Ago","09":"Sep","10":"Oct","11":"Nov","12":"Dic"}
-    cur_month_label = mnames.get(cur_month[5:], cur_month[5:]) + " " + cur_month[:4]
+    cur_month_label = mnames.get(cur_month[5:],"") + " " + cur_month[:4]
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -436,101 +587,84 @@ def build_html(order_records, appt_records, monthly, portfolio):
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="1800">
-  <title>Claims & Citas — Brio Management</title>
+  <title>Claims Dashboard — Brio Management</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <style>
-    body {{ background:#f0f4f8; font-family:'Segoe UI',Arial,sans-serif; }}
-    .topbar {{ background:linear-gradient(135deg,#1F3864,#2E75B6); color:#fff; padding:16px 28px 14px; }}
-    .topbar h1 {{ font-size:1.4rem; font-weight:700; margin:0; letter-spacing:.3px; }}
-    .topbar small {{ opacity:.8; font-size:.82rem; }}
-    .card {{ border:none; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.07); }}
-    .kpi-val {{ font-size:2rem; font-weight:700; color:#1F3864; line-height:1.1; }}
-    .kpi-val-sm {{ font-size:1.5rem; font-weight:700; color:#1F3864; line-height:1.1; }}
-    .kpi-label {{ font-size:.78rem; text-transform:uppercase; letter-spacing:.5px; color:#6c757d; }}
-    .section-title {{ font-size:.85rem; font-weight:600; text-transform:uppercase;
-                      letter-spacing:.6px; color:#1F3864; border-left:3px solid #2E75B6;
-                      padding-left:8px; margin-bottom:12px; }}
-    .chart-wrap {{ position:relative; height:260px; }}
-    .chart-wrap-sm {{ position:relative; height:200px; }}
-    .table th {{ font-size:.78rem; text-transform:uppercase; letter-spacing:.4px; }}
-    .table td {{ font-size:.83rem; vertical-align:middle; }}
-    .divider {{ font-size:.7rem; font-weight:700; text-transform:uppercase; letter-spacing:1px;
-                color:#fff; background:#1F3864; padding:4px 12px; border-radius:4px; margin:18px 0 10px; }}
-    code {{ background:#eef; border-radius:3px; padding:1px 4px; }}
-    .nav-tabs .nav-link {{ font-size:.82rem; font-weight:600; }}
+    body{{background:#f0f4f8;font-family:'Segoe UI',Arial,sans-serif;}}
+    .topbar{{background:linear-gradient(135deg,#1F3864,#2E75B6);color:#fff;padding:16px 28px 14px;}}
+    .topbar h1{{font-size:1.4rem;font-weight:700;margin:0;letter-spacing:.3px;}}
+    .topbar small{{opacity:.8;font-size:.82rem;}}
+    .card{{border:none;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);}}
+    .kpi-val{{font-size:1.9rem;font-weight:700;line-height:1.1;}}
+    .kpi-label{{font-size:.78rem;text-transform:uppercase;letter-spacing:.5px;color:#6c757d;}}
+    .section-title{{font-size:.85rem;font-weight:600;text-transform:uppercase;
+                    letter-spacing:.6px;color:#1F3864;border-left:3px solid #2E75B6;
+                    padding-left:8px;margin-bottom:12px;}}
+    .chart-wrap{{position:relative;height:260px;}}
+    .chart-wrap-sm{{position:relative;height:180px;}}
+    .table th{{font-size:.75rem;text-transform:uppercase;letter-spacing:.4px;}}
+    .table td{{font-size:.82rem;vertical-align:middle;}}
+    .divider{{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;
+              color:#fff;background:#1F3864;padding:4px 12px;border-radius:4px;margin:18px 0 10px;display:inline-block;}}
+    .nav-tabs .nav-link{{font-size:.82rem;font-weight:600;}}
+    code{{background:#eef;border-radius:3px;padding:1px 4px;font-size:.8em;}}
   </style>
 </head>
 <body>
 
 <div class="topbar d-flex justify-content-between align-items-center flex-wrap gap-2">
   <div>
-    <h1>Brio Management &mdash; Claims &amp; Citas Dashboard</h1>
-    <small>Actualizado: {now_et.strftime('%d/%m/%Y %H:%M')} ET &nbsp;&bull;&nbsp; Datos: Shopmonkey + NLS &nbsp;&bull;&nbsp; Se refresca automáticamente</small>
+    <h1>Brio Management &mdash; Claims &amp; Garantías Dashboard</h1>
+    <small>Actualizado: {now_et.strftime('%d/%m/%Y %H:%M')} ET &nbsp;&bull;&nbsp; NLS Tasks + Shopmonkey &nbsp;&bull;&nbsp; Auto-refresh 30min</small>
   </div>
   <div class="d-flex gap-2 flex-wrap">
-    <span class="badge bg-light text-dark fs-6 px-3 py-2">{total_orders} Órdenes</span>
-    <span class="badge bg-danger fs-6 px-3 py-2">{len(open_orders)} Abiertos</span>
-    <span class="badge bg-warning text-dark fs-6 px-3 py-2">{fmt_usd(total_cost)} Total</span>
+    <span class="badge bg-danger fs-6 px-3 py-2">{total_open} Abiertos</span>
+    <span class="badge bg-success fs-6 px-3 py-2">{total_closed} Cerrados</span>
+    <span class="badge bg-warning text-dark fs-6 px-3 py-2">{fmt_usd(total_cost)} Shopmonkey</span>
   </div>
 </div>
 
 <div class="container-fluid px-4 py-3">
 
-  <!-- ── SECCIÓN CLAIMS ── -->
-  <div class="divider">Claims / Órdenes de Trabajo</div>
-
-  <!-- KPI Claims -->
+  <!-- KPI Overview -->
   <div class="row g-3 mb-3">
     <div class="col-6 col-md-2">
       <div class="card p-3 h-100">
-        <div class="kpi-label">Total Órdenes</div>
-        <div class="kpi-val">{total_orders}</div>
-        <small class="text-muted">Todas</small>
+        <div class="kpi-label">Total Casos</div>
+        <div class="kpi-val text-dark">{len(cases)}</div>
+        <small class="text-muted">Todos los tipos</small>
+      </div>
+    </div>
+    <div class="col-6 col-md-2">
+      <div class="card p-3 h-100 border border-danger">
+        <div class="kpi-label">Casos Abiertos</div>
+        <div class="kpi-val text-danger">{total_open}</div>
+        <small class="text-muted">{fmt_usd(open_cost)} en curso</small>
       </div>
     </div>
     <div class="col-6 col-md-2">
       <div class="card p-3 h-100">
-        <div class="kpi-label">Total Facturado</div>
-        <div class="kpi-val">{fmt_usd(total_cost)}</div>
+        <div class="kpi-label">Total Shopmonkey $</div>
+        <div class="kpi-val text-primary">{fmt_usd(total_cost)}</div>
         <small class="text-muted">Acumulado</small>
       </div>
     </div>
     <div class="col-6 col-md-2">
       <div class="card p-3 h-100">
-        <div class="kpi-label">Motor / Trans</div>
-        <div class="kpi-val text-warning">{fmt_usd(total_et)}</div>
-        <small class="text-muted">{et_pct:.0f}% del total</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100 border-danger" style="border:2px solid #dc3545!important">
-        <div class="kpi-label">Claims Abiertos</div>
-        <div class="kpi-val text-danger">{len(open_orders)}</div>
-        <small class="text-muted">{fmt_usd(open_cost)} pendiente</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
         <div class="kpi-label">{cur_month_label}</div>
-        <div class="kpi-val text-primary">{fmt_usd(this_m_cost)}</div>
-        <small class="text-muted">{len(this_month_r)} órdenes</small>
+        <div class="kpi-val text-success">{this_m_new}</div>
+        <small class="text-muted">{fmt_usd(this_m_cost)} costo</small>
       </div>
     </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Motor/Trans Este Mes</div>
-        <div class="kpi-val-sm text-warning">{fmt_usd(this_m_et)}</div>
-        <small class="text-muted">Mes anterior: {fmt_usd(last_m_cost)}</small>
-      </div>
-    </div>
+    {cat_kpi_html}
   </div>
 
-  <!-- Charts Claims -->
+  <!-- Charts row -->
   <div class="row g-3 mb-3">
     <div class="col-md-8">
       <div class="card p-3 h-100">
-        <div class="section-title">Costo por Mes (últimos 12 meses)</div>
+        <div class="section-title">Casos Nuevos por Mes &amp; Costo Shopmonkey</div>
         <div class="chart-wrap">
           <canvas id="chartMonthly"></canvas>
         </div>
@@ -538,209 +672,180 @@ def build_html(order_records, appt_records, monthly, portfolio):
     </div>
     <div class="col-md-4">
       <div class="card p-3 h-100">
-        <div class="section-title">Por Portfolio</div>
+        <div class="section-title">Distribución por Categoría</div>
         <div class="chart-wrap">
-          <canvas id="chartPortfolio"></canvas>
+          <canvas id="chartPie"></canvas>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ── SECCIÓN CITAS ── -->
-  <div class="divider">Citas / Appointments</div>
-
-  <!-- KPI Citas -->
-  <div class="row g-3 mb-3">
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Total Citas</div>
-        <div class="kpi-val">{total_appts}</div>
-        <small class="text-muted">Todas</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Confirmadas</div>
-        <div class="kpi-val text-success">{conf_appts}</div>
-        <small class="text-muted">{conf_appts/total_appts*100:.0f}% del total</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Declinadas</div>
-        <div class="kpi-val text-danger">{decl_appts}</div>
-        <small class="text-muted">&nbsp;</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Sin Respuesta</div>
-        <div class="kpi-val text-warning">{noresp_appts}</div>
-        <small class="text-muted">&nbsp;</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="kpi-label">Citas {cur_month_label}</div>
-        <div class="kpi-val text-primary">{this_m_appts}</div>
-        <small class="text-muted">{conf_this_m} confirmadas</small>
-      </div>
-    </div>
-    <div class="col-6 col-md-2">
-      <div class="card p-3 h-100">
-        <div class="section-title mt-0 mb-2">Citas por Mes</div>
-        <div class="chart-wrap-sm">
-          <canvas id="chartAppts"></canvas>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── TABLAS con tabs ── -->
+  <!-- Tabs: Open + by category -->
   <div class="card p-3 mb-3">
     <ul class="nav nav-tabs mb-3" id="mainTabs">
       <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tabOpen">
-        Claims Abiertos <span class="badge bg-danger ms-1">{len(open_orders)}</span></a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabCitas">
-        Citas Recientes <span class="badge bg-secondary ms-1">{len(recent_appts)}</span></a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabMonthly">Resumen Mensual</a></li>
-      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabPortfolio">Por Portfolio</a></li>
+        🔴 Abiertos <span class="badge bg-danger ms-1">{total_open}</span></a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabFYBA">
+        🔵 FYBA Claim <span class="badge bg-primary ms-1">{cstats.get('FYBA / Insurance',{}).get('total',0)}</span></a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabFYBAR">
+        🔷 FYBA Remarketing <span class="badge bg-info ms-1">{cstats.get('FYBA / Remarketing',{}).get('total',0)}</span></a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabGarantia">
+        🟢 Garantía <span class="badge bg-success ms-1">{cstats.get('Garantía',{}).get('total',0)}</span></a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabVL">
+        🟠 Pérdida Total <span class="badge bg-warning text-dark ms-1">{cstats.get('Pérdida Total',{}).get('total',0)}</span></a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabExt">
+        ⚪ Externo Shopmonkey</a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabMonthly">
+        📊 Por Mes</a></li>
     </ul>
 
     <div class="tab-content">
 
-      <!-- Claims Abiertos -->
+      <!-- OPEN CASES -->
       <div class="tab-pane fade show active" id="tabOpen">
-        <div class="section-title">Claims Abiertos ({len(open_orders)} órdenes &mdash; {fmt_usd(open_cost)} pendiente)</div>
+        <div class="section-title">Casos Abiertos — {total_open} casos &mdash; {fmt_usd(open_cost)} en curso</div>
         <div class="table-responsive">
           <table class="table table-hover table-sm">
             <thead class="table-dark">
-              <tr>
-                <th>Fecha</th><th>#</th><th>Cliente</th><th>VIN</th><th>Loan</th>
-                <th>Portfolio</th><th class="text-end">Monto</th><th>Tipo</th><th>Descripción</th>
-              </tr>
+              <tr><th>Tipo</th><th>Fecha</th><th>Cliente</th><th>VIN</th><th>Loan</th>
+                  <th>Portfolio</th><th>Estado</th><th class="text-end">Costo SM</th>
+                  <th>Facturado a</th><th>Descripción</th></tr>
             </thead>
-            <tbody>{open_rows_html or '<tr><td colspan="9" class="text-center text-muted">No hay claims abiertos</td></tr>'}</tbody>
+            <tbody>{open_rows or '<tr><td colspan="10" class="text-center text-success fw-bold">✓ No hay casos abiertos</td></tr>'}</tbody>
           </table>
         </div>
       </div>
 
-      <!-- Citas Recientes -->
-      <div class="tab-pane fade" id="tabCitas">
-        <div class="section-title">Citas últimos 60 días ({len(recent_appts)} citas)</div>
+      <!-- FYBA -->
+      <div class="tab-pane fade" id="tabFYBA">
+        <div class="section-title">FYBA / Insurance Claims — Facturado a FYBA Reinsurance</div>
         <div class="table-responsive">
           <table class="table table-hover table-sm">
             <thead class="table-dark">
-              <tr>
-                <th>Fecha</th><th>Cliente</th><th>VIN</th><th>Loan</th>
-                <th>Portfolio</th><th>Status</th><th>Caso / Nota</th>
-              </tr>
+              <tr><th>Abierto</th><th>Cliente</th><th>VIN</th><th>Loan</th><th>Portfolio</th>
+                  <th>Estado</th><th>Cerrado</th><th class="text-end">Costo SM</th><th>Cita</th><th>Nota</th></tr>
             </thead>
-            <tbody>{appt_rows_html or '<tr><td colspan="7" class="text-center text-muted">Sin citas recientes</td></tr>'}</tbody>
+            <tbody>{rows_fyba}</tbody>
           </table>
         </div>
       </div>
 
-      <!-- Resumen Mensual -->
+      <!-- FYBA REMARKETING -->
+      <div class="tab-pane fade" id="tabFYBAR">
+        <div class="section-title">FYBA Remarketing — Repo recuperado, FYBA paga arreglos para reventa</div>
+        <div class="table-responsive">
+          <table class="table table-hover table-sm">
+            <thead class="table-dark">
+              <tr><th>Fecha</th><th>Cliente/VIN</th><th>VIN</th><th>Loan</th><th>Portfolio</th>
+                  <th>Estado</th><th>Cerrado</th><th class="text-end">Costo SM</th><th>Cita</th><th>Descripción</th></tr>
+            </thead>
+            <tbody>{rows_fybar}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- GARANTIA -->
+      <div class="tab-pane fade" id="tabGarantia">
+        <div class="section-title">Garantía — Mecánica cubierta por préstamo Brio</div>
+        <div class="table-responsive">
+          <table class="table table-hover table-sm">
+            <thead class="table-dark">
+              <tr><th>Abierto</th><th>Cliente</th><th>VIN</th><th>Loan</th><th>Portfolio</th>
+                  <th>Estado</th><th>Cerrado</th><th class="text-end">Costo SM</th><th>Cita</th><th>Nota</th></tr>
+            </thead>
+            <tbody>{rows_guar}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- VEHICLE LOSS -->
+      <div class="tab-pane fade" id="tabVL">
+        <div class="section-title">Pérdida Total / Vehicle Loss</div>
+        <div class="table-responsive">
+          <table class="table table-hover table-sm">
+            <thead class="table-dark">
+              <tr><th>Abierto</th><th>Cliente</th><th>VIN</th><th>Loan</th><th>Portfolio</th>
+                  <th>Estado</th><th>Cerrado</th><th class="text-end">Costo SM</th><th>Cita</th><th>Nota</th></tr>
+            </thead>
+            <tbody>{rows_vl}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- EXTERNO -->
+      <div class="tab-pane fade" id="tabExt">
+        <div class="section-title">Shopmonkey (Externo) — Sin task en NLS</div>
+        <div class="table-responsive">
+          <table class="table table-hover table-sm">
+            <thead class="table-dark">
+              <tr><th>Fecha</th><th>Cliente</th><th>VIN</th><th>Loan</th><th>Portfolio</th>
+                  <th>Estado</th><th>Cerrado</th><th class="text-end">Costo SM</th><th>Cita</th><th>Nota</th></tr>
+            </thead>
+            <tbody>{rows_ext}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- MONTHLY -->
       <div class="tab-pane fade" id="tabMonthly">
+        <div class="section-title">Resumen Mensual por Categoría</div>
         <div class="table-responsive">
           <table class="table table-hover table-sm">
             <thead class="table-dark">
-              <tr>
-                <th>Mes</th>
-                <th class="text-end">Órdenes</th>
-                <th class="text-end">Total $</th>
-                <th class="text-end">Motor/Trans $</th>
-                <th class="text-end">Abiertos</th>
-                <th class="text-end">Citas</th>
-                <th class="text-end">Conf.</th>
-                <th class="text-end">Decl.</th>
-              </tr>
+              <tr><th>Mes</th><th class="text-end">Total</th>
+                  <th class="text-end text-primary">FYBA</th>
+                  <th class="text-end text-success">Garantía</th>
+                  <th class="text-end text-warning">V.Loss</th>
+                  <th class="text-end text-secondary">Externo</th>
+                  <th class="text-end">Costo SM</th>
+                  <th class="text-end text-danger">Abiertos</th></tr>
             </thead>
-            <tbody>{monthly_rows_html}</tbody>
+            <tbody>{month_rows}</tbody>
           </table>
         </div>
       </div>
 
-      <!-- Por Portfolio -->
-      <div class="tab-pane fade" id="tabPortfolio">
-        <div class="table-responsive">
-          <table class="table table-hover table-sm">
-            <thead class="table-dark">
-              <tr>
-                <th>Portfolio</th>
-                <th class="text-end">Órdenes</th>
-                <th class="text-end">Total $</th>
-                <th class="text-end">Motor/Trans $</th>
-                <th class="text-end">ET %</th>
-                <th class="text-end">Abiertos</th>
-              </tr>
-            </thead>
-            <tbody>{port_rows_html}</tbody>
-          </table>
-        </div>
-      </div>
-
-    </div><!-- tab-content -->
+    </div>
   </div>
-
-</div><!-- container -->
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-const labels = {chart_labels};
-const totals = {chart_total};
-const etCost = {chart_et};
-const apptTotals = {chart_appts};
-const apptConf  = {chart_conf};
-const portLabels = {port_labels};
-const portVals   = {port_vals};
+const labels  = {chart_labels};
+const fyba    = {chart_fyba};
+const fybar   = {chart_fybar};
+const guar    = {chart_guar};
+const vl      = {chart_vl};
+const ext     = {chart_ext};
+const costArr = {chart_cost};
+const pieLabels = {pie_labels};
+const pieVals   = {pie_vals};
 
-// Monthly cost chart
-new Chart(document.getElementById('chartMonthly'), {{
-  type: 'bar',
-  data: {{
+new Chart(document.getElementById('chartMonthly'),{{
+  type:'bar',
+  data:{{
     labels,
-    datasets: [
-      {{ label: 'Total Facturado', data: totals,
-         backgroundColor: 'rgba(46,117,182,0.7)', borderColor: '#2E75B6', borderWidth:1 }},
-      {{ label: 'Motor/Trans', data: etCost,
-         backgroundColor: 'rgba(255,192,0,0.7)', borderColor: '#FFC000', borderWidth:1 }},
+    datasets:[
+      {{label:'FYBA Claim',       data:fyba,  backgroundColor:'rgba(46,117,182,.7)'}},
+      {{label:'FYBA Remarketing', data:fybar, backgroundColor:'rgba(0,112,192,.5)'}},
+      {{label:'Garantía',         data:guar,  backgroundColor:'rgba(112,173,71,.7)'}},
+      {{label:'V.Loss',           data:vl,    backgroundColor:'rgba(237,125,49,.7)'}},
+      {{label:'Externo',          data:ext,   backgroundColor:'rgba(112,48,160,.4)'}},
     ]
   }},
-  options: {{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{{ legend:{{ position:'top' }}, tooltip:{{ callbacks:{{ label: ctx => '$'+ctx.parsed.y.toLocaleString() }} }} }},
-    scales:{{ y:{{ ticks:{{ callback: v => '$'+v.toLocaleString() }} }} }}
+  options:{{
+    responsive:true,maintainAspectRatio:false,
+    plugins:{{legend:{{position:'top'}}}},
+    scales:{{x:{{stacked:true}},y:{{stacked:true,beginAtZero:true}}}}
   }}
 }});
 
-// Portfolio pie
-new Chart(document.getElementById('chartPortfolio'), {{
-  type: 'doughnut',
-  data: {{ labels: portLabels, datasets:[{{ data: portVals,
-    backgroundColor:['#2E75B6','#ED7D31','#A9D18E','#FFC000','#FF0000','#7030A0','#00B0F0','#92D050'] }}] }},
-  options: {{ responsive:true, maintainAspectRatio:false,
-    plugins:{{ legend:{{ position:'bottom', labels:{{ font:{{size:10}} }} }} }} }}
-}});
-
-// Appointments bar
-new Chart(document.getElementById('chartAppts'), {{
-  type: 'bar',
-  data: {{
-    labels,
-    datasets: [
-      {{ label: 'Confirmadas', data: apptConf,
-         backgroundColor: 'rgba(25,135,84,0.7)' }},
-      {{ label: 'Total Citas', data: apptTotals,
-         backgroundColor: 'rgba(108,117,125,0.3)' }},
-    ]
-  }},
-  options: {{
-    responsive:true, maintainAspectRatio:false,
-    plugins:{{ legend:{{ position:'bottom', labels:{{ font:{{size:9}} }} }} }},
-    scales:{{ y:{{ beginAtZero:true }} }}
-  }}
+new Chart(document.getElementById('chartPie'),{{
+  type:'doughnut',
+  data:{{labels:pieLabels,datasets:[{{data:pieVals,
+    backgroundColor:['#2E75B6','#0070C0','#70AD47','#ED7D31','#7030A0']}}]}},
+  options:{{responsive:true,maintainAspectRatio:false,
+    plugins:{{legend:{{position:'bottom',labels:{{font:{{size:10}}}}}}}}}}
 }});
 </script>
 </body>
@@ -749,34 +854,32 @@ new Chart(document.getElementById('chartAppts'), {{
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    nls_tasks  = fetch_nls_tasks()
+    repo_vins  = fetch_nls_repo_vins()
     orders     = fetch_orders()
     appts      = fetch_appointments()
 
     all_vids   = list(set(
-        (o.get("vehicleId") or "") for o in orders + appts
-        if o.get("vehicleId")
+        (o.get("vehicleId") or "") for o in orders + appts if o.get("vehicleId")
     ))
     vid_to_vin = fetch_vins(all_vids)
-
     services   = fetch_services([o["id"] for o in orders])
 
-    all_vins   = set(vid_to_vin.values())
-    nls_map    = nls_lookup(all_vins)
+    cases = build_cases(nls_tasks, orders, appts, vid_to_vin, services, repo_vins)
 
-    order_records = build_order_records(orders, vid_to_vin, services, nls_map)
-    appt_records  = build_appt_records(appts, vid_to_vin, nls_map)
-    monthly       = monthly_stats(order_records, appt_records)
-    portfolio     = portfolio_stats(order_records)
+    stats = cat_stats(cases)
+    print(f"\nCases built: {len(cases)}")
+    for cat, s in stats.items():
+        print(f"  {cat}: {s['total']} total | {s['open']} open | {fmt_usd(s['cost'])}")
 
-    html = build_html(order_records, appt_records, monthly, portfolio)
+    html = build_html(cases)
 
-    out_dir = os.path.join(os.path.dirname(__file__), "docs")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "index.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"Saved: {out}")
-    print(f"Orders: {len(order_records)} | Open: {sum(1 for r in order_records if r['is_open'])} | Appts: {len(appt_records)}")
+    print(f"\nSaved: {out}")
 
 if __name__ == "__main__":
     main()
