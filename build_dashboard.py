@@ -305,7 +305,7 @@ def fetch_vins(vehicle_ids):
             if len(vin) >= 6:
                 return vid, vin
         return vid, None
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {ex.submit(get_vin, vid): vid for vid in vehicle_ids}
         for fut in as_completed(futs):
             vid, vin = fut.result()
@@ -314,6 +314,7 @@ def fetch_vins(vehicle_ids):
             done[0] += 1
             if done[0] % 100 == 0:
                 print(f"  VINs: {done[0]}/{len(vehicle_ids)}")
+                time.sleep(2)  # pequeña pausa cada 100 calls
     print(f"VINs fetched: {len(vid_to_vin)}")
     return vid_to_vin
 
@@ -335,7 +336,7 @@ def fetch_services(order_ids):
             is_et  = any(k in (name+desc).lower() for k in ENG_KW)
             svcs.append({"name": name, "desc": desc, "cost": cost, "is_et": is_et})
         return oid, svcs
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {ex.submit(get_svc, oid): oid for oid in order_ids}
         for fut in as_completed(futs):
             oid, svcs = fut.result()
@@ -343,6 +344,7 @@ def fetch_services(order_ids):
             done[0] += 1
             if done[0] % 100 == 0:
                 print(f"  Services: {done[0]}/{len(order_ids)}")
+                time.sleep(3)  # pausa cada 100 calls
     print("Services done")
     return result
 
